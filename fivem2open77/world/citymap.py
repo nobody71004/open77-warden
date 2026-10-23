@@ -1,0 +1,857 @@
+"""Night City in 3D: the game's own world-map model, for the Studio's Live maps.
+
+The map screen of Cyberpunk 2077 draws the city from a handful of files under
+base\\entities\\cameras\\3dmap: a terrain, the roads and their kerbs, the metro (NCART lines in their
+colours), the water, a few landmarks, ~10,000 building volumes (the box colliders of three
+collision meshes: what the map's cursor hits) and the district outlines (trigger areas of
+3dmap_view.ent, the entity that also places every part).
+
+The buildings the map screen *shows* are finer than its colliders: each district is a point cloud
+of oriented blocks, ~257,000 for the city, kept in a 16-bit RGBA texture
+(base\\fx\\textures\\3dmap\\static\\<district>_data.xbm, three square tiles side by side: the
+blocks' positions, their rotations as quaternions, their sizes) that the triangle soup mesh
+(3dmap_triangle_soup.mesh, material 3d_map_cubes.mt) turns into boxes on the GPU.  Its material
+instance per district gives the decoding: TransMin / TransMax (the position range, relative to the
+component), CubeSize (the size range), the tile size (PointCloudTextureHeight) and BaseColor, a
+top-down grey map of the district (<district>_m.xbm) the blocks take their shade from.  ``cubes``
+decodes them into the same oriented boxes as the colliders.
+
+``build`` reads them out of the player's own game with WolvenKit -- the meshes exported to glTF
+(``uncook``), the entity and the collision meshes serialized to JSON -- puts every part where the
+entity puts it, in Night City's world coordinates (metres, x east, y north, z up, the frame of every
+position the Studio shows), and writes a compact cache: ``citymap.json`` (what is where) and
+``citymap.bin`` (float32 positions, uint32 indices, uint8 colours, float32 building boxes) that
+the browser reads straight into typed arrays.  The cache stays on this machine: it is made from
+the installed game and is never shipped anywhere.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import time
+import uuid
+
+import numpy as np
+
+from ..cp77.glbread import accessor, read_glb
+
+VERSION = 2                           # 2: the map screen's own building blocks (cubes)
+READABLE = (1, 2)                     # older caches still open (without the blocks)
+FOLDER = "base\\entities\\cameras\\3dmap"
+TEXTURES = "base\\fx\\textures\\3dmap\\static"
+REGEX = r"^(base\\entities\\cameras\\3dmap\\[^\\]+\.(mesh|ent)|base\\fx\\textures\\3dmap\\static\\[^\\]+\.xbm)$"
+SOUP = "3dmap_triangle_soup"
+VIEW = "3dmap_view.ent"
+FIXED = 131072.0                      # WorldPosition FixedPoint: 1/131072 m
+WELD = 200.0                          # vertices closer than 5 mm are one
+LAYER_OF = {"3dmap_terrain": "terrain", "3dmap_water": "water", "3dmap_roads": "roads",
+            "3dmap_roads_borders": "borders", "3dmap_metro": "metro", "3dmap_cliffs": "cliffs"}
+COLOURED = ("roads", "metro")         # their vertex colours mean something (road class, NCART line)
+SKIP_MESHES = {"3dmap_triangle_soup", "mappin_geo_bulb", "box"}   # district data quads, the cursor pin, a hack
+DISTRICTS = {
+    "watson": "Watson", "westbrook": "Westbrook", "city_center": "City Center", "heywood": "Heywood",
+    "santo_domingo": "Santo Domingo", "pacifica": "Pacifica", "dogtown": "Dogtown", "morro_rock": "Morro Rock",
+    "kabuki": "Kabuki", "little_china": "Little China", "northside": "Northside",
+    "arasaka_waterfront": "Arasaka Waterfront", "japan_town": "Japantown", "charter_hill": "Charter Hill",
+    "north_oak": "North Oak", "corpo_plaza": "Corpo Plaza", "downtown": "Downtown", "glen": "The Glen",
+    "vista_del_rey": "Vista del Rey", "wellspring": "Wellsprings", "arroyo": "Arroyo",
+    "rancho_coronado": "Rancho Coronado", "coastview": "Coastview", "west_wind_estate": "West Wind Estate",
+}
+TOP_DISTRICTS = ("watson", "westbrook", "city_center", "heywood", "santo_domingo", "pacifica", "dogtown", "morro_rock")
+
+
+class CityMapError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------- transforms
+def quat_matrix(q) -> np.ndarray:
+    """(x, y, z, w) -> 3x3 rotation."""
+    x, y, z, w = (float(v) for v in q)
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def matrix_quat(m) -> tuple:
+    """3x3 rotation -> (x, y, z, w)."""
+    m = np.asarray(m, np.float64)
+    tr = m[0, 0] + m[1, 1] + m[2, 2]
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        return ((m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s, 0.25 * s)
+    if m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2
+        return (0.25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s, (m[2, 1] - m[1, 2]) / s)
+    if m[1, 1] > m[2, 2]:
+        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2
+        return ((m[0, 1] + m[1, 0]) / s, 0.25 * s, (m[1, 2] + m[2, 1]) / s, (m[0, 2] - m[2, 0]) / s)
+    s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2
+    return ((m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, 0.25 * s, (m[1, 0] - m[0, 1]) / s)
+
+
+def _num(v) -> float:
+    if isinstance(v, dict):
+        return v.get("Bits", 0) / FIXED
+    return float(v or 0)
+
+
+def _vec(v, keys=("X", "Y", "Z")) -> np.ndarray:
+    return np.array([float((v or {}).get(k, 0) or 0) for k in keys], np.float64)
+
+
+def _quat(o) -> tuple:
+    o = o or {}
+    return (float(o.get("i", 0)), float(o.get("j", 0)), float(o.get("k", 0)), float(o.get("r", 1)))
+
+
+def _name(v) -> str:
+    if isinstance(v, dict):
+        return str(v.get("$value") or "")
+    return str(v or "")
+
+
+class _Handles:
+    """WolvenKit JSON handles: {"HandleId": n, "Data": ...} defined once, {"HandleRefId": n} after."""
+
+    def __init__(self, doc):
+        self.by_id = {}
+        stack = [doc]
+        while stack:
+            o = stack.pop()
+            if isinstance(o, dict):
+                if "HandleId" in o and isinstance(o.get("Data"), dict):
+                    self.by_id[str(o["HandleId"])] = o["Data"]
+                stack.extend(o.values())
+            elif isinstance(o, list):
+                stack.extend(o)
+
+    def get(self, ref):
+        if not isinstance(ref, dict):
+            return None
+        if isinstance(ref.get("Data"), dict):
+            return ref["Data"]
+        rid = ref.get("HandleRefId", ref.get("HandleId"))
+        return self.by_id.get(str(rid)) if rid is not None else None
+
+
+class Scene:
+    """3dmap_view.ent: its components by name and their world transforms (parent bindings)."""
+
+    def __init__(self, ent_json: dict):
+        self.handles = _Handles(ent_json)
+        root = ent_json.get("Data", {}).get("RootChunk", ent_json)
+        self.components = {}
+        for c in root.get("components") or []:
+            if isinstance(c, dict) and "$type" not in c and isinstance(c.get("Data"), dict):
+                c = c["Data"]
+            n = _name(c.get("name"))
+            if n and n not in self.components:
+                self.components[n] = c
+        self._memo = {}
+
+    def parent_of(self, c):
+        b = self.handles.get(c.get("parentTransform"))
+        return _name(b.get("bindName")) if b else None
+
+    def local(self, c):
+        lt = c.get("localTransform") or {}
+        p = lt.get("Position") or {}
+        t = np.array([_num(p.get("x")), _num(p.get("y")), _num(p.get("z"))], np.float64)
+        return quat_matrix(_quat(lt.get("Orientation"))), t
+
+    def world(self, name, _depth=0):
+        """(3x3 rotation, translation) of a component in world space."""
+        if name in self._memo:
+            return self._memo[name]
+        c = self.components.get(name)
+        if c is None or _depth > 32:
+            return np.eye(3), np.zeros(3)
+        r, t = self.local(c)
+        par = self.parent_of(c)
+        if par and par != name and par in self.components:
+            pr, pt = self.world(par, _depth + 1)
+            r, t = pr @ r, pt + pr @ t
+        self._memo[name] = (r, t)
+        return r, t
+
+    def ancestors(self, name):
+        out, seen = [], {name}
+        c = self.components.get(name)
+        while c is not None:
+            par = self.parent_of(c)
+            if not par or par in seen:
+                break
+            seen.add(par)
+            out.append(par)
+            c = self.components.get(par)
+        return out
+
+    def mesh_components(self):
+        """[(name, mesh stem, component)] of the components that draw a mesh on the world map."""
+        out = []
+        for n, c in self.components.items():
+            if c.get("$type") not in ("entMeshComponent", "entPhysicalMeshComponent"):
+                continue
+            mesh = _name((c.get("mesh") or {}).get("DepotPath"))
+            if not mesh:
+                continue
+            out.append((n, os.path.splitext(mesh.replace("\\", "/").split("/")[-1])[0].lower(), c))
+        return out
+
+    def districts(self) -> list:
+        """The map's district and sub-district outlines in world space."""
+        out, seen = [], set()
+        for n, c in self.components.items():
+            if c.get("$type") != "gameStaticTriggerAreaComponent" or not n.endswith("_trigger"):
+                continue
+            key = n[:-len("_trigger")]
+            o = self.handles.get(c.get("outline"))
+            pts = (o or {}).get("points") or []
+            if len(pts) < 3:
+                continue
+            r, t = self.world(n)
+            w = np.array([t + r @ _vec(p) for p in pts])
+            sig = tuple(np.round(w[:, :2]).astype(np.int64).ravel()[:12])
+            if sig in seen:                       # ncx = morro_rock, worldmap_sub = dogtown
+                continue
+            seen.add(sig)
+            parent = None
+            for a in self.ancestors(n):
+                if a.endswith("_trigger") and a != n:
+                    parent = a[:-len("_trigger")]
+                    break
+            out.append({"id": key, "label": DISTRICTS.get(key, key.replace("_", " ").title()),
+                        "top": key in TOP_DISTRICTS, "parent": parent if key not in TOP_DISTRICTS else None,
+                        "height": round(float((o or {}).get("height") or 0), 1),
+                        "outline": [[round(float(x), 2), round(float(y), 2), round(float(z), 2)] for x, y, z in w]})
+        order = {k: i for i, k in enumerate(TOP_DISTRICTS)}
+        out.sort(key=lambda d: (not d["top"], order.get(d["id"], 99), d["label"]))
+        return out
+
+
+# ---------------------------------------------------------------------- geometry
+def glb_geometry(path: str, coloured=False):
+    """A WolvenKit glTF export -> (positions (N, 3) in the mesh's own Z-up frame, triangles (M, 3),
+    colours (N, 4) uint8 or None).  glTF is Y-up: (x, y, z) game = (x, -z, y) glTF."""
+    js, binary = read_glb(path)
+    node_of = {}
+    for nd in js.get("nodes") or []:
+        if "mesh" in nd:
+            node_of.setdefault(nd["mesh"], nd)
+    P, T, C, off = [], [], [], 0
+    for mi, m in enumerate(js.get("meshes") or []):
+        nd = node_of.get(mi) or {}
+        nm = None
+        if nd.get("matrix"):
+            nm = np.array(nd["matrix"], np.float64).reshape(4, 4).T
+        elif nd.get("translation") or nd.get("rotation") or nd.get("scale"):
+            nm = np.eye(4)
+            nm[:3, :3] = quat_matrix(nd.get("rotation") or (0, 0, 0, 1)) * np.array(nd.get("scale") or (1, 1, 1))
+            nm[:3, 3] = nd.get("translation") or (0, 0, 0)
+        for prim in m.get("primitives") or []:
+            if prim.get("mode", 4) != 4 or "POSITION" not in prim.get("attributes", {}):
+                continue
+            pos = accessor(js, binary, prim["attributes"]["POSITION"]).astype(np.float64)
+            if nm is not None:
+                pos = pos @ nm[:3, :3].T + nm[:3, 3]
+            if "indices" in prim:
+                tri = accessor(js, binary, prim["indices"]).reshape(-1).astype(np.int64)
+            else:
+                tri = np.arange(len(pos), dtype=np.int64)
+            tri = tri[:len(tri) // 3 * 3].reshape(-1, 3)
+            P.append(np.stack([pos[:, 0], -pos[:, 2], pos[:, 1]], 1))
+            T.append(tri + off)
+            if coloured:
+                col = prim["attributes"].get("COLOR_0")
+                c = accessor(js, binary, col) if col is not None else np.ones((len(pos), 4))
+                c = np.asarray(c, np.float64)
+                if c.shape[1] == 3:
+                    c = np.concatenate([c, np.ones((len(c), 1))], 1)
+                if np.issubdtype(np.asarray(c).dtype, np.integer):
+                    c = c / 255.0
+                C.append(np.clip(np.rint(c * 255), 0, 255).astype(np.uint8))
+            off += len(pos)
+    if not P:
+        return np.zeros((0, 3)), np.zeros((0, 3), np.int64), None
+    return np.concatenate(P), np.concatenate(T), (np.concatenate(C) if coloured else None)
+
+
+def weld(pos, tri, col=None):
+    """Merge coincident vertices (and drop the triangles that collapse)."""
+    if not len(pos):
+        return pos, tri, col
+    key = np.rint(pos * WELD).astype(np.int64)
+    if col is not None:
+        key = np.concatenate([key, col.astype(np.int64)], 1)
+    _, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    inv = inv.reshape(-1)
+    tri = inv[tri]
+    keep = (tri[:, 0] != tri[:, 1]) & (tri[:, 1] != tri[:, 2]) & (tri[:, 0] != tri[:, 2])
+    tri = tri[keep]
+    if len(tri):                                   # the same triangle twice (chunk seams): once
+        _, once = np.unique(np.sort(tri, axis=1), axis=0, return_index=True)
+        tri = tri[np.sort(once)]
+    return pos[first], tri, (col[first] if col is not None else None)
+
+
+def building_boxes(mesh_json: dict, r=None, t=None) -> np.ndarray:
+    """A 3D-map collision mesh -> (N, 10) float64 boxes [cx cy cz hx hy hz qx qy qz qw] (world)."""
+    r = np.eye(3) if r is None else r
+    t = np.zeros(3) if t is None else t
+    handles = _Handles(mesh_json)
+    root = mesh_json.get("Data", {}).get("RootChunk", mesh_json)
+    out = []
+    for prm in root.get("parameters") or []:
+        d = handles.get(prm) or {}
+        if d.get("$type") != "meshMeshParamPhysics":
+            continue
+        res = handles.get(d.get("physicsData")) or {}
+        for body in res.get("bodies") or []:
+            b = handles.get(body) or {}
+            bt = b.get("localToModel") or {}
+            br, btr = quat_matrix(_quat(bt.get("orientation"))), _vec(bt.get("position"))
+            for sh in b.get("collisionShapes") or []:
+                s = handles.get(sh) or {}
+                if s.get("$type") != "physicsColliderBox":
+                    continue
+                st = s.get("localToBody") or {}
+                sr, stt = quat_matrix(_quat(st.get("orientation"))), _vec(st.get("position"))
+                he = np.abs(_vec(s.get("halfExtents")))
+                if not np.all(np.isfinite(he)) or he.max() <= 0.01:
+                    continue
+                rot = r @ br @ sr
+                cen = t + r @ (btr + br @ stt)
+                out.append([*cen, *he, *matrix_quat(rot)])
+    return np.array(out, np.float64).reshape(-1, 10)
+
+
+# ---------------------------------------------------------------------- the map screen's blocks
+def material_params(mesh_json: dict) -> dict:
+    """{material name: {parameter: value}} of a mesh's local material instances (textures as depot
+    paths, vectors as [x, y, z, w])."""
+    handles = _Handles(mesh_json)
+    root = mesh_json.get("Data", {}).get("RootChunk", mesh_json)
+    insts = ((root.get("localMaterialBuffer") or {}).get("materials") or root.get("preloadLocalMaterialInstances")
+             or [])
+    by_index = {int(e.get("index", -1)): _name(e.get("name")) for e in root.get("materialEntries") or []
+                if e.get("isLocalInstance", True)}
+    out = {}
+    for i, m in enumerate(insts):
+        m = handles.get(m) or (m if isinstance(m, dict) else {})
+        vals = {}
+        for v in m.get("values") or []:
+            for k, x in v.items():
+                if k == "$type":
+                    continue
+                if isinstance(x, dict) and "DepotPath" in x:
+                    x = _name(x.get("DepotPath"))
+                elif isinstance(x, dict) and "X" in x:
+                    x = [float(x.get("X", 0)), float(x.get("Y", 0)), float(x.get("Z", 0)), float(x.get("W", 0))]
+                vals[k] = x
+        out[by_index.get(i, str(i))] = vals
+    return out
+
+
+def decode_cubes(data: np.ndarray, side: int, tmin, tmax, cube_size, r=None, t=None) -> np.ndarray:
+    """A district's point-cloud texture (side x 3*side RGBA16: positions | quaternions | sizes) ->
+    (N, 10) float64 boxes [cx cy cz hx hy hz qx qy qz qw] in world space (half extents, as the
+    colliders).  A texel whose position alpha is 0 is padding."""
+    r = np.eye(3) if r is None else np.asarray(r, np.float64)
+    t = np.zeros(3) if t is None else np.asarray(t, np.float64)
+    a = np.asarray(data, np.uint16).reshape(side, 3 * side, 4).astype(np.float64)
+    pos, rot, size = (a[:, k * side:(k + 1) * side].reshape(-1, 4) for k in range(3))
+    keep = (pos[:, 3] > 0) & (size[:, :3].max(1) > 0)
+    pos, rot, size = pos[keep], rot[keep], size[keep]
+    lo, hi = np.asarray(tmin, np.float64)[:3], np.asarray(tmax, np.float64)[:3]
+    local = lo + pos[:, :3] / 65535.0 * (hi - lo)
+    cen = local @ r.T + t
+    q = rot / 65535.0 * 2.0 - 1.0                           # (x, y, z, w), signed
+    q /= np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-9)
+    if not np.allclose(r, np.eye(3)):                       # the component turned: turn the blocks with it
+        cq = np.array(matrix_quat(r))
+        q = _qmul(np.broadcast_to(cq, q.shape), q)
+    half = size[:, :3] / 65535.0 * float(cube_size) / 2.0
+    return np.concatenate([cen, half, q], 1)
+
+
+def _qmul(a, b):
+    ax, ay, az, aw = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    bx, by, bz, bw = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    return np.stack([aw * bx + ax * bw + ay * bz - az * by, aw * by - ax * bz + ay * bw + az * bx,
+                     aw * bz + ax * by - ay * bx + az * bw, aw * bw - ax * bx - ay * by - az * bz], 1)
+
+
+def _texture(json_dir: str, buf_dir: str, depot: str):
+    """(setup dict, buffer bytes) of a texture WolvenKit exported with -fb xbm, or (None, None)."""
+    stem = os.path.basename(depot.replace("\\", "/"))
+    jp = os.path.join(json_dir, stem + ".json")
+    bp = os.path.join(buf_dir, stem + ".0.buffer")
+    if not (os.path.isfile(jp) and os.path.isfile(bp)):
+        return None, None
+    with open(jp, encoding="utf-8") as f:
+        root = json.load(f).get("Data", {}).get("RootChunk", {})
+    with open(bp, "rb") as f:
+        return root, f.read()
+
+
+def _grey(root: dict, raw: bytes):
+    """A BaseColor map (BC4 grey, the top mip) -> uint8 (n, n), or None."""
+    from ..imaging import decode
+    from ..gta.texture import FMT_ATI1
+    w, h = int(root.get("width") or 0), int(root.get("height") or 0)
+    comp = str((root.get("setup") or {}).get("compression") or "")
+    if not w or not h:
+        return None
+    if comp in ("TCM_QualityR", "TCM_DXTAlpha", "TCM_Normal"):          # BC4 (one channel)
+        img = decode(FMT_ATI1, w, h, raw[:max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * 8])
+        return None if img is None else img[..., 0].copy()
+    if comp == "TCM_None" and len(raw) >= w * h:
+        return np.frombuffer(raw[:w * h], np.uint8).reshape(h, w).copy()
+    return None
+
+
+def cubes(scene: "Scene", soup_json, json_dir: str = None, buf_dir: str = None, log=print, params_of=None, texture=None) -> list:
+    """The map screen's building blocks, district by district -> [{id, boxes (N, 10), shade (N,)
+    uint8, mask (uint8 n x n or None), mask_min, mask_max, edge}].  The material of an appearance
+    and a texture's (setup, pixels) come from ``params_of(appearance)`` and ``texture(depot)`` (the
+    game read directly), else from WolvenKit's JSON of the triangle soup and its exports."""
+    if params_of is None:
+        params = material_params(soup_json)
+        params_of = params.get
+    if texture is None:
+        def texture(depot):
+            return _texture(json_dir, buf_dir, depot)
+    out = []
+    for name, c in scene.components.items():
+        if c.get("$type") != "entMeshComponent" or SOUP not in _name((c.get("mesh") or {}).get("DepotPath")).lower():
+            continue
+        app = _name(c.get("meshAppearance")) or "default"
+        p = params_of(app)
+        if not p or not p.get("WorldPosTex"):
+            log(f"citymap: {name}: no material for appearance {app}")
+            continue
+        side = int(p.get("PointCloudTextureHeight") or 0)
+        root, raw = texture(p["WorldPosTex"])
+        if root is None:
+            log(f"citymap: {name}: {p['WorldPosTex']} was not read")
+            continue
+        fmt = str((root.get("setup") or {}).get("rawFormat") or "")
+        w, h = int(root.get("width") or 0), int(root.get("height") or 0)
+        if fmt != "TRF_DeepColor" or w != 3 * h or h != side or len(raw) < w * h * 8:
+            log(f"citymap: {name}: unexpected point cloud {w}x{h} {fmt} ({len(raw)} bytes): left out")
+            continue
+        if "TransMin" not in p or "TransMax" not in p or not p.get("CubeSize"):
+            log(f"citymap: {name}: no position range in its material: left out")
+            continue
+        r, t = scene.world(name)
+        boxes = decode_cubes(np.frombuffer(raw[:w * h * 8], np.uint16), side, p["TransMin"], p["TransMax"],
+                             p["CubeSize"], r, t)
+        # the shade under each block: the district's BaseColor map, top-down over the position range
+        lo = np.asarray(p["TransMin"][:2], np.float64) + t[:2]
+        hi = np.asarray(p["TransMax"][:2], np.float64) + t[:2]
+        mask = None
+        if p.get("BaseColor"):
+            mr, mraw = texture(p["BaseColor"])
+            mask = _grey(mr, mraw) if mr is not None else None
+        if mask is not None:
+            n_v, n_u = mask.shape
+            u = np.clip(((boxes[:, 0] - lo[0]) / (hi[0] - lo[0]) * n_u).astype(np.int64), 0, n_u - 1)
+            v = np.clip(((boxes[:, 1] - lo[1]) / (hi[1] - lo[1]) * n_v).astype(np.int64), 0, n_v - 1)
+            shade = mask[v, u]
+        else:
+            shade = np.full(len(boxes), 160, np.uint8)
+        district = re.sub(r"_data\d*$", "", name)
+        out.append({"id": district, "boxes": boxes, "shade": shade.astype(np.uint8), "mask": mask,
+                    "mask_min": [round(float(lo[0]), 2), round(float(lo[1]), 2)],
+                    "mask_max": [round(float(hi[0]), 2), round(float(hi[1]), 2)],
+                    "edge": [float(p.get("EdgeThickness") or 0.0005), float(p.get("EdgeSharpnessPower") or 50)]})
+        log(f"citymap: {district}: {len(boxes)} blocks")
+    return out
+
+
+# ---------------------------------------------------------------------- the cache
+def cache_dir(workspace: str) -> str:
+    return os.path.join(workspace, "citymap")
+
+
+def read_meta(out_dir: str):
+    p = os.path.join(out_dir, "citymap.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if meta.get("version") not in READABLE or not os.path.isfile(os.path.join(out_dir, "citymap.bin")):
+        return None
+    return meta
+
+
+def game_stamp(game_dir: str | None) -> int:
+    """Newest modification time of the game's archives (a patch changes it)."""
+    best = 0
+    for sub in ("content", "ep1"):
+        d = os.path.join(game_dir or "", "archive", "pc", sub)
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            if fn.endswith(".archive"):
+                try:
+                    best = max(best, int(os.path.getmtime(os.path.join(d, fn))))
+                except OSError:
+                    pass
+    return best
+
+
+def status(out_dir: str, game_dir: str | None = None) -> dict:
+    meta = read_meta(out_dir)
+    if not meta:
+        return {"ready": False}
+    st = {"ready": True, "key": meta.get("key"), "built": meta.get("built"), "stats": meta.get("stats"),
+          "bytes": os.path.getsize(os.path.join(out_dir, "citymap.bin")), "version": meta.get("version"),
+          "upgrade": meta.get("version") != VERSION}      # built by an older Studio: a rebuild adds detail
+    if game_dir and meta.get("game_stamp"):
+        now = game_stamp(game_dir)
+        st["stale"] = bool(now and now != meta["game_stamp"])
+    return st
+
+
+class _Writer:
+    def __init__(self):
+        self.parts, self.size = [], 0
+
+    def add(self, arr) -> list:
+        b = np.ascontiguousarray(arr).tobytes()
+        off = self.size
+        self.parts.append(b)
+        self.size += len(b)
+        pad = (-self.size) % 16
+        if pad:
+            self.parts.append(b"\0" * pad)
+            self.size += pad
+        return [off, int(np.asarray(arr).size)]
+
+
+def assemble(raw_dir: str, glb_dir: str, json_dir: str, log=print, buf_dir: str | None = None) -> tuple:
+    """WolvenKit's output (raw files, glTF exports, JSON; buf_dir: the textures' pixel buffers) ->
+    (meta dict, binary bytes)."""
+    ent = os.path.join(json_dir, VIEW + ".json")
+    if not os.path.isfile(ent):
+        raise CityMapError(f"{VIEW} was not read from the game")
+    with open(ent, encoding="utf-8") as f:
+        scene = Scene(json.load(f))
+
+    def geometry(path, stem, coloured):
+        gp = os.path.join(glb_dir, stem + ".glb")
+        return glb_geometry(gp, coloured=coloured) if os.path.isfile(gp) else None
+
+    def mesh_doc(path, stem):
+        jp = os.path.join(json_dir, stem + ".mesh.json")
+        if not os.path.isfile(jp):
+            return None
+        with open(jp, encoding="utf-8") as f:
+            return json.load(f)
+
+    soup = os.path.join(json_dir, SOUP + ".mesh.json")
+    blocks = None
+    if buf_dir and os.path.isfile(soup):
+        with open(soup, encoding="utf-8") as f:
+            soup_json = json.load(f)
+        blocks = lambda: cubes(scene, soup_json, json_dir, buf_dir, log=log)   # noqa: E731
+    return compose(scene, geometry, mesh_doc, blocks, log=log)
+
+
+def compose(scene: "Scene", geometry, mesh_doc, blocks=None, log=print) -> tuple:
+    """The 3D map from its parts -> (meta dict, binary bytes).
+      geometry(depot path, stem, coloured) -> (positions (N, 3) in the mesh's frame, triangles, colours) or None
+      mesh_doc(depot path, stem) -> a collision mesh as WolvenKit-shaped JSON, or None
+      blocks() -> cubes(...) (the map screen's blocks), or None"""
+    w = _Writer()
+    layers = {}
+    acc = {}
+    landmarks = []
+    boxes = []
+    for name, stem, c in scene.mesh_components():
+        if stem in SKIP_MESHES or _name(c.get("meshAppearance")).lower() == "seethrough":
+            continue
+        path = _name((c.get("mesh") or {}).get("DepotPath"))
+        layer_mask = str(c.get("renderSceneLayerMask") or "")
+        if c.get("$type") == "entPhysicalMeshComponent":
+            if not stem.startswith("3dmap_coll_buildings"):
+                continue
+            doc = mesh_doc(path, stem)
+            if doc is None:
+                log(f"citymap: {stem}.mesh was not read: its buildings are missing")
+                continue
+            r, t = scene.world(name)
+            b = building_boxes(doc, r, t)
+            boxes.append(b)
+            log(f"citymap: {stem}: {len(b)} buildings")
+            continue
+        if layer_mask and "WorldMap" not in layer_mask:
+            continue
+        layer = LAYER_OF.get(stem, "landmarks")
+        got = geometry(path, stem, layer in COLOURED)
+        if got is None:
+            log(f"citymap: {stem}.mesh has no export, left out")
+            continue
+        pos, tri, col = got
+        if not len(tri):
+            continue
+        r, t = scene.world(name)
+        s = _vec(c.get("visualScale"), ("X", "Y", "Z")) if c.get("visualScale") else np.ones(3)
+        s = np.where(np.abs(s) < 1e-6, 1.0, s)
+        pos = (pos * s) @ r.T + t
+        a = acc.setdefault(layer, {"pos": [], "tri": [], "col": [], "n": 0})
+        a["tri"].append(tri + a["n"])
+        a["pos"].append(pos)
+        if col is not None:
+            a["col"].append(col)
+        a["n"] += len(pos)
+        if layer == "landmarks":
+            lo, hi = pos.min(0), pos.max(0)
+            landmarks.append({"id": name, "center": [round(float(v), 1) for v in (lo + hi) / 2],
+                              "top": round(float(hi[2]), 1)})
+    stats = {}
+    bounds = None
+    for layer in ("terrain", "water", "cliffs", "roads", "borders", "metro", "landmarks"):
+        a = acc.get(layer)
+        if not a:
+            continue
+        pos = np.concatenate(a["pos"])
+        tri = np.concatenate(a["tri"])
+        col = np.concatenate(a["col"]) if a["col"] else None
+        pos, tri, col = weld(pos, tri, col)
+        entry = {"vertices": int(len(pos)), "triangles": int(len(tri)),
+                 "min": [round(float(v), 2) for v in pos.min(0)], "max": [round(float(v), 2) for v in pos.max(0)],
+                 "pos": w.add(pos.astype(np.float32)), "idx": w.add(tri.astype(np.uint32))}
+        if col is not None:
+            entry["col"] = w.add(col.astype(np.uint8))
+        layers[layer] = entry
+        stats[layer] = int(len(tri))
+        if layer != "water":
+            lo, hi = pos.min(0), pos.max(0)
+            bounds = (lo, hi) if bounds is None else (np.minimum(bounds[0], lo), np.maximum(bounds[1], hi))
+    if "terrain" not in layers:
+        raise CityMapError("the map's terrain (3dmap_terrain.mesh) was not read from the game")
+    meta = {"version": VERSION, "frame": "Night City world: metres, x east, y north, z up",
+            "layers": layers, "landmarks": landmarks, "districts": scene.districts()}
+    if boxes:
+        b = np.concatenate(boxes)
+        ext = np.array([np.abs(quat_matrix(q)) @ he for q, he in zip(b[:, 6:10], b[:, 3:6])]).reshape(-1, 3)
+        meta["buildings"] = {"count": int(len(b)), "stride": 10, "layout": "cx cy cz hx hy hz qx qy qz qw",
+                             "data": w.add(b.astype(np.float32)),
+                             "min": [round(float(v), 1) for v in (b[:, :3] - ext).min(0)],
+                             "max": [round(float(v), 1) for v in (b[:, :3] + ext).max(0)]}
+        stats["buildings"] = int(len(b))
+    if blocks is not None:
+        blocks = blocks()
+        if blocks:
+            allb = np.concatenate([d["boxes"] for d in blocks])
+            shade = np.concatenate([d["shade"] for d in blocks])
+            entry = {"count": int(len(allb)), "stride": 10, "layout": "cx cy cz hx hy hz qx qy qz qw",
+                     "data": w.add(allb.astype(np.float32)), "shade": w.add(shade.astype(np.uint8)), "districts": []}
+            start = 0
+            for d in blocks:
+                e = {"id": d["id"], "start": start, "count": int(len(d["boxes"])), "edge": d["edge"],
+                     "mask_min": d["mask_min"], "mask_max": d["mask_max"]}
+                if d["mask"] is not None:
+                    e["mask"] = {"w": int(d["mask"].shape[1]), "h": int(d["mask"].shape[0]),
+                                 "data": w.add(np.ascontiguousarray(d["mask"], np.uint8))}
+                entry["districts"].append(e)
+                start += len(d["boxes"])
+            ext = np.abs(allb[:, 3:6]).max(1, keepdims=True)
+            entry["min"] = [round(float(v), 1) for v in (allb[:, :3] - ext).min(0)]
+            entry["max"] = [round(float(v), 1) for v in (allb[:, :3] + ext).max(0)]
+            meta["cubes"] = entry
+            stats["blocks"] = int(len(allb))
+    if boxes:
+        lo, hi = np.array(meta["buildings"]["min"]), np.array(meta["buildings"]["max"])
+        city = (lo, hi)
+    else:
+        city = bounds
+    meta["city"] = {"min": [round(float(v), 1) for v in city[0]], "max": [round(float(v), 1) for v in city[1]]}
+    meta["stats"] = stats
+    meta["bytes"] = w.size
+    return meta, b"".join(w.parts)
+
+
+def build(wk, game_dir: str, out_dir: str, scratch: str, log=print, progress=None) -> dict:
+    """Read the 3D map out of the game (WolvenKit) and write the cache.  -> its status."""
+    if not game_dir or not os.path.isdir(os.path.join(game_dir, "archive", "pc")):
+        raise CityMapError("Cyberpunk 2077 was not found: set its folder in Settings > Tools")
+    pc = os.path.join(game_dir, "archive", "pc")
+    archives = [os.path.join(pc, d) for d in ("content", "ep1") if os.path.isdir(os.path.join(pc, d))]
+    if not archives:
+        raise CityMapError(f"no game archives under {pc}")
+    work = os.path.join(scratch, "citymap-" + uuid.uuid4().hex[:8])
+    raw, glb, src, js = (os.path.join(work, x) for x in ("raw", "glb", "src", "json"))
+    for d in (raw, glb, src, js):
+        os.makedirs(d, exist_ok=True)
+    step = progress or (lambda f, m: None)
+    try:
+        step(0.05, "exporting the 3D map from the game")
+        # -o gets the files as they are in the archives, -or the exports (glTF for meshes)
+        # (-fb xbm: the map's textures as their pixel buffers, next to the glTF exports)
+        out = wk.run(["uncook", *archives, "-o", raw, "-or", glb, "-gp", game_dir, "-r", REGEX,
+                      "--mesh-export-type", "MeshOnly", "--mesh-export-lod-filter", "-fb", "xbm"], timeout=3600, check=False)
+        folder = FOLDER.replace("\\", os.sep)
+        rdir, gdir = os.path.join(raw, folder), os.path.join(glb, folder)
+        if not os.path.isfile(os.path.join(rdir, VIEW)):
+            tail = "\n".join(out.splitlines()[-12:])
+            raise CityMapError(f"the game's 3D map ({FOLDER}\\{VIEW}) was not found in {', '.join(archives)}:\n{tail}")
+        n_glb = len([f for f in os.listdir(gdir)]) if os.path.isdir(gdir) else 0
+        log(f"citymap: {len(os.listdir(rdir))} files read, {n_glb} exported")
+        step(0.55, "reading the districts and buildings")
+        for fn in os.listdir(rdir):
+            if fn == VIEW or fn == SOUP + ".mesh" or re.match(r"^3dmap_coll_buildings\d*\.mesh$", fn):
+                shutil.copyfile(os.path.join(rdir, fn), os.path.join(src, fn))
+        tdir = os.path.join(raw, TEXTURES.replace("\\", os.sep))
+        tbuf = os.path.join(glb, TEXTURES.replace("\\", os.sep))
+        if os.path.isdir(tdir):                    # the blocks' textures: their setup (size, format)
+            for fn in os.listdir(tdir):
+                if fn.endswith(".xbm"):
+                    shutil.copyfile(os.path.join(tdir, fn), os.path.join(src, fn))
+        else:
+            log("citymap: the map's block textures were not found: the city gets its collider boxes only")
+        wk.serialize(src, js)
+        step(0.75, "building the city")
+        meta, data = assemble(rdir, gdir, js, log=log, buf_dir=tbuf if os.path.isdir(tbuf) else None)
+        meta["source"] = "wolvenkit"
+        step(0.95, "saving")
+        return _save(out_dir, meta, data, game_dir, log)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _save(out_dir: str, meta: dict, data: bytes, game_dir: str | None, log=print) -> dict:
+    meta["built"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    meta["game_stamp"] = game_stamp(game_dir)
+    meta["key"] = f"{int(time.time())}"
+    os.makedirs(out_dir, exist_ok=True)
+    tmp_bin = os.path.join(out_dir, "citymap.bin.tmp")
+    tmp_json = os.path.join(out_dir, "citymap.json.tmp")
+    with open(tmp_bin, "wb") as f:
+        f.write(data)
+    with open(tmp_json, "w", encoding="utf-8") as f:
+        json.dump(meta, f, separators=(",", ":"))
+    os.replace(tmp_bin, os.path.join(out_dir, "citymap.bin"))
+    os.replace(tmp_json, os.path.join(out_dir, "citymap.json"))
+    log(f"citymap: ready ({', '.join(f'{k} {v}' for k, v in meta['stats'].items())}; {len(meta['districts'])} districts)")
+    return status(out_dir)
+
+
+# ---------------------------------------------------------------------- straight from the game
+def _param_value(v):
+    """A material parameter as material_params gives it: a texture its depot path, a vector a list."""
+    if isinstance(v, dict) and "X" in v:
+        return [float(v.get("X", 0)), float(v.get("Y", 0)), float(v.get("Z", 0)), float(v.get("W", 0))]
+    if isinstance(v, dict) and "DepotPath" in v:
+        return _name(v.get("DepotPath"))
+    return v
+
+
+def build_native(gw, out_dir: str, log=print, progress=None) -> dict:
+    """Read the 3D map straight out of the game's archives (world/gameworld.py: no WolvenKit) and write
+    the cache -> its status.  The same parts as build(): the entity, the meshes (geometry and
+    colours), the collision meshes' boxes, the triangle soup's materials and its textures."""
+    from ..cp77 import cr2wjson
+    from ..cp77 import meshread as MR
+    step = progress or (lambda f, m: None)
+    step(0.05, "reading the 3D map from the game")
+    t0 = time.time()
+    view_path = FOLDER + "\\" + VIEW
+    ent = gw.fetch(view_path)
+    if ent is None:
+        raise CityMapError(f"the game's 3D map ({view_path}) is not in its archives")
+    scene = Scene(cr2wjson.doc(ent))
+    if not scene.components:
+        raise CityMapError(f"{view_path} has no components the Studio can read")
+    log(f"citymap: {VIEW}: {len(scene.components)} components")
+    files = {}
+
+    def mesh(path):
+        key = path.lower()
+        if key not in files:
+            data = gw.read(path)
+            files[key] = MR.CR2W(data, gw.kraken) if data else None
+        return files[key]
+
+    def geometry(path, stem, coloured):
+        c = mesh(path)
+        if c is None:
+            return None
+        try:
+            chunks = MR.read_geometry(c, colour=coloured)
+        except MR.MeshReadError as e:
+            log(f"citymap: {stem}.mesh: {e}")
+            return None
+        if not chunks:
+            return None
+        P, T, C, off = [], [], [], 0
+        for ch in chunks:
+            P.append(ch["positions"].astype(np.float64))
+            T.append(ch["indices"].reshape(-1, 3)[:, [1, 0, 2]].astype(np.int64) + off)   # (WolvenKit's winding)
+            if coloured:
+                col = ch.get("colours")
+                C.append(col if col is not None else np.full((len(ch["positions"]), 4), 255, np.uint8))
+            off += len(ch["positions"])
+        return np.concatenate(P), np.concatenate(T), (np.concatenate(C) if coloured else None)
+
+    def mesh_doc(path, stem):
+        c = mesh(path)
+        return cr2wjson.doc(c) if c is not None else None
+
+    step(0.2, "reading the map's meshes")
+    soup_path = next((_name((c.get("mesh") or {}).get("DepotPath")) for _n, stem, c in scene.mesh_components() if stem == SOUP), None)
+    blocks = None
+    if soup_path:
+        soup = mesh(soup_path)
+        if soup is not None:
+            mats = MR.Materials(soup, gw.fetch, gw.kraken)
+            apps = dict(MR.appearances(soup))
+
+            def params_of(app):
+                names = [m for m in (apps.get(app) or []) if m] + [app]
+                for n in names:
+                    m = mats.get(n)
+                    if m:
+                        return {k: _param_value(v) for k, v in m["Data"].items()}
+                return None
+
+            def texture(depot):
+                c = gw.fetch(depot)
+                return MR.texture_raw(c, 0) if c is not None else (None, None)
+
+            blocks = lambda: cubes(scene, None, log=log, params_of=params_of, texture=texture)   # noqa: E731
+    step(0.55, "putting the city together")
+    meta, data = compose(scene, geometry, mesh_doc, blocks, log=log)
+    meta["source"] = "game"
+    log(f"citymap: read from the game in {time.time() - t0:.1f} s")
+    short = plausible(meta)
+    if short:
+        # (never over a good cache: WolvenKit reads it instead where it can)
+        raise CityMapError(f"the map read from the game looks incomplete ({short})")
+    step(0.95, "saving")
+    return _save(out_dir, meta, data, gw.game_dir, log)
+
+
+# what Night City's 3D map holds at the least (2.x has ~96,000 terrain and ~57,000 road triangles,
+# ~10,000 building boxes, ~255,000 map blocks, 23 districts): a quarter of it, or less, is a misread
+PLAUSIBLE = {"terrain": 20000, "roads": 10000, "buildings": 2000, "blocks": 50000}
+PLAUSIBLE_DISTRICTS = 10
+
+
+def plausible(meta: dict) -> str:
+    """'' when a city map has what Night City's has; else what is short."""
+    stats = meta.get("stats") or {}
+    short = [f"{k} {stats.get(k, 0)} < {n}" for k, n in PLAUSIBLE.items() if (stats.get(k) or 0) < n]
+    nd = len(meta.get("districts") or [])
+    if nd < PLAUSIBLE_DISTRICTS:
+        short.append(f"districts {nd} < {PLAUSIBLE_DISTRICTS}")
+    return ", ".join(short)

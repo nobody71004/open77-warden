@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+out/
+host-warden/bin/
+host-warden/obj/
+*.log

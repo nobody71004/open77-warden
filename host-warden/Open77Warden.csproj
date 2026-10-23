@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Open77 Warden for Windows: a WebView2 window around the Warden app's local server (embedded
+       Python): each Open77 server's own Warden panel, reached over SSH, beside a live 3D map of Night
+       City with its players.  .NET Framework 4.8 (part of Windows 10/11): no runtime to install.
+       The start screen, the icon loader and the job object are the Studio's (host/), linked here. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>open77-warden</AssemblyName>
+    <RootNamespace>Open77.Warden</RootNamespace>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>1.0.1</Version>
+    <Company>fivem2open77</Company>
+    <Product>Open77 Warden</Product>
+    <Description>Your Open77 servers' Warden panels with a live 3D map of their players</Description>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\host\HudSplash.cs" Link="Shared\HudSplash.cs" />
+    <Compile Include="..\host\AppIcon.cs" Link="Shared\AppIcon.cs" />
+    <Compile Include="..\host\JobObject.cs" Link="Shared\JobObject.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- the Warden icon and emblem (tools/brand/make_warden_brand.py), under the names the shared start
+         screen and icon loader read -->
+    <EmbeddedResource Include="app.ico" LogicalName="Fivem2Open77.Studio.app.ico" />
+    <EmbeddedResource Include="emblem.png" LogicalName="Fivem2Open77.Studio.emblem.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="Microsoft.CSharp" />
+  </ItemGroup>
+</Project>
